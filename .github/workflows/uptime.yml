@@ -1,0 +1,82 @@
+# Alerta EXTERNA de caídas de Crona (BACKLOG 13c-b, 2026-10-20). Corre en los servidores de GitHub, no en el NAS:
+# si el NAS, el túnel o Infisical se caen, esto igual se entera. La página /estado vive en el NAS y se cae con todo.
+#
+# Cada 10 minutos pide /api/health de prod. Si no da 200 con status "ok" (tras 2 reintentos), abre un issue
+# con la etiqueta `caida` (llega como notificación de GitHub, al mail y al celular) y el job falla (mail de
+# "workflow failed"). Si vuelve y hay un issue abierto, lo comenta y lo cierra. Un solo issue por caída.
+#
+# Repo público a propósito: en público los minutos de Actions no se cobran. No tiene secretos: sólo pide un endpoint
+# público.
+name: uptime
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+    # Latido mensual: GitHub apaga los cron de un repo sin commits en 60 días.
+    - cron: '0 12 1 * *'
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'URL a probar (para ensayar la alerta con una que falle)'
+        required: false
+
+permissions:
+  issues: write
+  contents: write
+
+concurrency:
+  group: uptime
+  cancel-in-progress: false
+
+jobs:
+  chequeo:
+    if: github.event.schedule != '0 12 1 * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Pedir /api/health
+        id: salud
+        env:
+          URL: ${{ inputs.url || 'https://crona.com.ar/api/health' }}
+        run: |
+          codigo=$(curl -sS -o cuerpo.json -w '%{http_code}' --max-time 20 --retry 2 --retry-delay 30 --retry-all-errors "$URL" || echo 000)
+          estado=$(jq -r '.status // empty' cuerpo.json 2>/dev/null || true)
+          echo "codigo=$codigo" >> "$GITHUB_OUTPUT"
+          echo "estado=$estado" >> "$GITHUB_OUTPUT"
+          echo "HTTP $codigo, status=${estado:-?}"
+          if [ "$codigo" = "200" ] && [ "$estado" = "ok" ]; then echo "ok=true" >> "$GITHUB_OUTPUT"; else echo "ok=false" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Abrir o cerrar el issue de caída
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          OK: ${{ steps.salud.outputs.ok }}
+          CODIGO: ${{ steps.salud.outputs.codigo }}
+          ESTADO: ${{ steps.salud.outputs.estado }}
+          URL: ${{ inputs.url || 'https://crona.com.ar/api/health' }}
+        run: |
+          gh label create caida --color B60205 --description 'Crona prod no responde' 2>/dev/null || true
+          abierto=$(gh issue list --label caida --state open --json number --jq '.[0].number // empty')
+          ahora=$(TZ=America/Argentina/Buenos_Aires date '+%d/%m %H:%M')
+          if [ "$OK" = "true" ]; then
+            if [ -n "$abierto" ]; then
+              gh issue close "$abierto" --comment "Recuperado ($ahora, hora argentina): $URL responde 200 ok."
+            fi
+            exit 0
+          fi
+          if [ -z "$abierto" ]; then
+            gh issue create --label caida --title "Crona caído: HTTP $CODIGO ($ahora)" \
+              --body "$URL respondió HTTP $CODIGO, status=${ESTADO:-sin cuerpo}, a las $ahora (hora argentina), tras 2 reintentos. Se cierra solo cuando vuelve."
+          fi
+          echo "::error::Crona no responde: HTTP $CODIGO"
+          exit 1
+
+  latido:
+    if: github.event.schedule == '0 12 1 * *'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          date -u +%FT%TZ > latido.txt
+          git config user.name github-actions && git config user.email github-actions@users.noreply.github.com
+          git add latido.txt && git commit -m "latido mensual" && git push
